@@ -1,0 +1,224 @@
+name: Build Alice APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: 17}
+      - uses: gradle/actions/setup-gradle@v4
+        with: {gradle-version: 8.7}
+      - name: Create project and build
+        run: |
+          set -e
+          mkdir proj && cd proj
+          cat > settings.gradle.kts <<'ALICE_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Alice"
+          include(":app")
+          ALICE_EOF
+          cat > build.gradle.kts <<'ALICE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ALICE_EOF
+          cat > gradle.properties <<'ALICE_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          ALICE_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ALICE_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.romeorex.alice"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.romeorex.alice"; minSdk = 24; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          ALICE_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ALICE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <application android:label="Alice" android:allowBackup="true" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ALICE_EOF
+          mkdir -p app/src/main/java/com/romeorex/alice
+          cat > app/src/main/java/com/romeorex/alice/MainActivity.kt <<'ALICE_EOF'
+          package com.romeorex.alice
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import org.json.JSONObject
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+              private lateinit var wv: WebView
+              private var tts: TextToSpeech? = null
+              private var sr: SpeechRecognizer? = null
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  tts = TextToSpeech(this) {}
+                  wv = WebView(this)
+                  setContentView(wv)
+                  wv.settings.javaScriptEnabled = true
+                  wv.settings.domStorageEnabled = true
+                  wv.addJavascriptInterface(Bridge(), "Android")
+                  val html = assets.open("index.html").bufferedReader().readText()
+                  wv.loadDataWithBaseURL("https://alice.local/", html, "text/html", "utf-8", null)
+              }
+
+              private fun js(code: String) = runOnUiThread { wv.evaluateJavascript(code, null) }
+
+              private fun listen(lang: String) {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
+                  }
+                  sr?.destroy()
+                  sr = SpeechRecognizer.createSpeechRecognizer(this)
+                  sr!!.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(p: Bundle?) { js("listenState(true)") }
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(x: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onError(e: Int) { js("listenState(false)") }
+                      override fun onPartialResults(p: Bundle?) {}
+                      override fun onEvent(t: Int, p: Bundle?) {}
+                      override fun onResults(r: Bundle?) {
+                          js("listenState(false)")
+                          val t = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
+                          js("onHeard(" + JSONObject.quote(t) + ")")
+                      }
+                  })
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+                  sr!!.startListening(i)
+              }
+
+              private fun start(i: Intent) { try { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (e: Exception) {} }
+
+              inner class Bridge {
+                  @JavascriptInterface fun listen(lang: String) { runOnUiThread { this@MainActivity.listen(lang) } }
+                  @JavascriptInterface fun speak(t: String, lang: String) {
+                      tts?.language = Locale.forLanguageTag(lang)
+                      tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "a")
+                  }
+                  @JavascriptInterface fun stop() { tts?.stop() }
+                  @JavascriptInterface fun openUrl(u: String) { runOnUiThread { start(Intent(Intent.ACTION_VIEW, Uri.parse(u))) } }
+                  @JavascriptInterface fun openSettings() { runOnUiThread { start(Intent(Settings.ACTION_SETTINGS)) } }
+                  @JavascriptInterface fun openCamera() { runOnUiThread { start(Intent(MediaStore.ACTION_IMAGE_CAPTURE)) } }
+                  @JavascriptInterface fun openApp(name: String): Boolean {
+                      val q = name.trim().lowercase()
+                      if (q.isEmpty()) return false
+                      val pm = packageManager
+                      val app = pm.getInstalledApplications(0).firstOrNull {
+                          pm.getLaunchIntentForPackage(it.packageName) != null &&
+                              pm.getApplicationLabel(it).toString().lowercase().contains(q)
+                      } ?: return false
+                      runOnUiThread { start(pm.getLaunchIntentForPackage(app.packageName)!!) }
+                      return true
+                  }
+              }
+          }
+          ALICE_EOF
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/index.html <<'ALICE_EOF'
+          <!DOCTYPE html><html lang="hi"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>
+          :root{--bg:#0b1020;--card:#161b2e;--fg:#eef0fa;--mut:#9aa1b8;--acc:#7b7bff;--bd:#262c45}
+          *{box-sizing:border-box}html,body{height:100%;margin:0}
+          body{background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;display:flex;flex-direction:column}
+          header{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--bd)}
+          .logo{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#5b5bf0,#b06bff);display:grid;place-items:center;font-weight:700}
+          h1{font-size:18px;margin:0;flex:1}small{display:block;color:var(--mut);font-weight:400;font-size:12px}
+          button{font:inherit;border:0;cursor:pointer;color:var(--fg)}
+          .chip{background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:6px 12px;font-size:13px}
+          #log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+          .m{max-width:86%;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+          .u{align-self:flex-end;background:#5b5bf0;border-bottom-right-radius:4px}
+          .a{align-self:flex-start;background:var(--card);border:1px solid var(--bd);border-bottom-left-radius:4px}
+          form{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--bd)}
+          input{flex:1;min-width:0;font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--bd);border-radius:999px;padding:12px 16px;outline:none}
+          .ic{width:46px;height:46px;border-radius:50%;background:var(--acc);font-size:20px;flex:none}
+          .rec{background:#e5484d}
+          </style></head><body>
+          <header><div class="logo">A</div><h1>Alice<small id="st">Aapka AI assistant</small></h1>
+          <button class="chip" id="lang">हिं</button><button class="chip" id="key">🔑</button></header>
+          <div id="log"></div>
+          <form id="f"><input id="q" placeholder="Kuch bhi poochho…" autocomplete="off">
+          <button type="button" class="ic" id="mic">🎤</button><button class="ic">➤</button></form>
+          <script>
+          var log=document.getElementById('log'),q=document.getElementById('q'),st=document.getElementById('st'),mic=document.getElementById('mic');
+          var lang='hi-IN',hist=[],busy=false,KEY=localStorage.getItem('akey')||'';
+          function add(t,c){var d=document.createElement('div');d.className='m '+c;d.textContent=t;log.appendChild(d);log.scrollTop=log.scrollHeight;return d}
+          function say(t){try{Android.speak(t.slice(0,600),lang)}catch(e){}}
+          function setKey(){document.getElementById('f').style.display='none';
+           var i=document.createElement('input');i.placeholder='Anthropic API key (sk-ant-…)';i.type='password';i.style.margin='12px';
+           var b=document.createElement('button');b.className='chip';b.textContent='Save';b.style.margin='0 12px 12px';
+           var w=document.createElement('div');w.append(i,b);document.body.insertBefore(w,document.getElementById('f'));
+           b.onclick=function(){KEY=i.value.trim();localStorage.setItem('akey',KEY);w.remove();document.getElementById('f').style.display='flex';add('Key save ho gayi.','a')}}
+          document.getElementById('key').onclick=setKey;
+          document.getElementById('lang').onclick=function(){lang=lang==='hi-IN'?'en-IN':'hi-IN';this.textContent=lang==='hi-IN'?'हिं':'EN'};
+          function listenState(on){mic.classList.toggle('rec',on);st.textContent=on?'Sun rahi hoon…':'Aapka AI assistant'}
+          function onHeard(t){ask(t)}
+          mic.onclick=function(){Android.stop();Android.listen(lang)};
+          function local(t){var s=t.toLowerCase(),m;
+           if(/(time|samay|baje)/.test(s)&&/(kya|what|batao|now|abhi)/.test(s))return 'Abhi '+new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'})+' ho rahe hain.';
+           if(/camera/.test(s)&&/(khol|open)/.test(s)){Android.openCamera();return 'Camera khol rahi hoon.'}
+           if(/settings/.test(s)&&/(khol|open)/.test(s)){Android.openSettings();return 'Settings khol rahi hoon.'}
+           if((m=s.match(/(?:call|phone)\s*(?:karo)?\s*([+\d][\d\s-]{6,})/))){Android.openUrl('tel:'+m[1].replace(/[\s-]/g,''));return 'Dialer khol rahi hoon.'}
+           if((m=s.match(/^(?:open|launch)\s+(.+)$/))||(m=s.match(/^(.+?)\s+(?:kholo|khol do|chalao|open karo)$/))){
+            var n=m[1].replace(/^(app|the)\s+/,'');if(Android.openApp(n))return n+' khol rahi hoon.'}
+           return null}
+          async function ask(t){t=(t||'').trim();if(!t||busy)return;add(t,'u');q.value='';
+           var l=local(t);if(l){add(l,'a');say(l);return}
+           if(!KEY){add('Pehle 🔑 dabakar API key daalo.','a');return}
+           busy=true;st.textContent='Soch rahi hoon…';var b=add('…','a');
+           hist.push({role:'user',content:t});hist=hist.slice(-10);
+           try{var r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':KEY,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+            body:JSON.stringify({model:'claude-haiku-5-5',max_tokens:500,system:'You are Alice, a friendly voice-first assistant on a budget Android phone. Reply in the user\'s language/style (Hindi, English or Hinglish in Roman script). Be short and practical (max ~100 words). No markdown symbols.',messages:hist})});
+            var d=await r.json();var a=d.content&&d.content[0]&&d.content[0].text||('Error: '+(d.error&&d.error.message||r.status));
+            b.textContent=a;if(d.content){hist.push({role:'assistant',content:a});say(a)}else hist.pop()}
+           catch(e){b.textContent='Internet ya key check karo.';hist.pop()}
+           busy=false;st.textContent='Aapka AI assistant'}
+          document.getElementById('f').onsubmit=function(e){e.preventDefault();ask(q.value)};
+          add('Namaste! Main Alice hoon. Pehle 🔑 se API key daalo, phir 🎤 dabakar bolo ya type karo. "WhatsApp kholo", "call 98xxxxxxxx" jaise commands bhi chalte hain.','a');
+          </script></body></html>
+          ALICE_EOF
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Alice-APK
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
